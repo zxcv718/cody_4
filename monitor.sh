@@ -6,6 +6,8 @@ APP_PATH="${APP_PATH:-$AGENT_HOME/agent-app}"
 APP_USER="${APP_USER:-agent-admin}"
 APP_PORT="${APP_PORT:-15034}"
 LOG_FILE="${LOG_FILE:-/var/log/agent-app/monitor.log}"
+DISK_PATH="${DISK_PATH:-/}"
+CPU_SAMPLE_INTERVAL="${CPU_SAMPLE_INTERVAL:-1}"
 MAX_LOG_SIZE="${MAX_LOG_SIZE:-10485760}"
 MAX_LOG_FILES="${MAX_LOG_FILES:-10}"
 
@@ -27,10 +29,10 @@ fail_health_check() {
 find_app_pid() {
   local pid
 
-  pid=$(pgrep -u "$APP_USER" -f "$APP_PATH" 2>/dev/null | head -n 1 || true)
+  pid=$(pgrep -u "$APP_USER" -f "$APP_PATH" 2>/dev/null | paste -sd, - || true)
 
   if [ -z "$pid" ]; then
-    pid=$(pgrep -u "$APP_USER" -x "$(basename "$APP_PATH")" 2>/dev/null | head -n 1 || true)
+    pid=$(pgrep -u "$APP_USER" -x "$(basename "$APP_PATH")" 2>/dev/null | paste -sd, - || true)
   fi
 
   printf '%s' "$pid"
@@ -91,12 +93,67 @@ check_firewall() {
   fi
 }
 
-collect_resources() {
-  read -r CPU MEM < <(ps -p "$PID" -o %cpu=,%mem= 2>/dev/null || echo "0 0")
+collect_cpu_usage() {
+  local idle1
+  local idle2
+  local total1
+  local total2
 
+  read -r idle1 total1 < <(
+    awk 'NR == 1 {
+      idle = $5 + $6
+      total = 0
+      for (i = 2; i <= NF; i++) total += $i
+      print idle, total
+      exit
+    }' /proc/stat
+  )
+
+  sleep "$CPU_SAMPLE_INTERVAL"
+
+  read -r idle2 total2 < <(
+    awk 'NR == 1 {
+      idle = $5 + $6
+      total = 0
+      for (i = 2; i <= NF; i++) total += $i
+      print idle, total
+      exit
+    }' /proc/stat
+  )
+
+  awk -v idle_delta="$((idle2 - idle1))" -v total_delta="$((total2 - total1))" \
+    'BEGIN {
+      if (total_delta <= 0) {
+        printf "0.0"
+      } else {
+        printf "%.1f", ((total_delta - idle_delta) / total_delta) * 100
+      }
+    }'
+}
+
+collect_memory_usage() {
+  awk '
+    /^MemTotal:/ { total = $2 }
+    /^MemAvailable:/ { available = $2 }
+    END {
+      if (total <= 0) {
+        printf "0.0"
+      } else {
+        printf "%.1f", ((total - available) / total) * 100
+      }
+    }
+  ' /proc/meminfo
+}
+
+collect_resources() {
+  CPU=$(collect_cpu_usage)
+  MEM=$(collect_memory_usage)
   CPU="${CPU:-0}"
   MEM="${MEM:-0}"
-  DISK_USED=$(df -P / 2>/dev/null | awk 'NR == 2 {gsub(/%/, "", $5); print $5}')
+  DISK_USED=$(
+    df -P "$DISK_PATH" 2>/dev/null |
+      awk 'NR == 2 && $2 > 0 {printf "%.1f", ($3 / $2) * 100}'
+  )
   DISK_USED="${DISK_USED:-0}"
 }
 
